@@ -1,29 +1,24 @@
 import os
-import nibabel as nib
 import numpy as np
-import pandas as pd
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
+import nibabel as nib
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
-import torch.nn as nn
+from sklearn.metrics import roc_auc_score
 
-# -------- LOAD LABELS --------
-labels_df = pd.read_csv("../../hugenv/example_download_script/train_labels.csv")
+from data_common import load_labels, get_split, CACHE_DIR, SEED
 
-# Map VolumeName → Lung nodule (0/1)
-file_to_label = dict(zip(labels_df['VolumeName'], labels_df['Lung nodule']))
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
 
 # -------- DATASET --------
 class LungDataset2p5D(Dataset):
-    def __init__(self, root_dir):
-        self.files = []
-        for root, _, files in os.walk(root_dir):
-            for f in files:
-                if f.endswith(".nii.gz"):
-                    self.files.append(os.path.join(root, f))
-
-        self.files = self.files[:300]  # limit for speed
+    def __init__(self, files, file_to_labels):
+        self.files = files
+        self.file_to_labels = file_to_labels
 
     def __len__(self):
         return len(self.files)
@@ -31,74 +26,90 @@ class LungDataset2p5D(Dataset):
     def __getitem__(self, idx):
         file_path = self.files[idx]
         filename = os.path.basename(file_path).replace(".nii.gz", "")
+        cache_path = os.path.join(CACHE_DIR, filename + ".npy")
 
-        img = nib.load(file_path)
-        data = img.get_fdata()
+        if os.path.exists(cache_path):
+            slice_stack = torch.from_numpy(np.load(cache_path)).float()
+        else:
+            data = nib.load(file_path).get_fdata()
+            z = data.shape[2] // 2
+            z_minus = max(z - 1, 0)
+            z_plus = min(z + 1, data.shape[2] - 1)
+            slice_stack = np.stack([data[:, :, z_minus], data[:, :, z], data[:, :, z_plus]], axis=0)
+            slice_stack = (slice_stack - np.mean(slice_stack)) / (np.std(slice_stack) + 1e-8)
+            slice_stack = torch.tensor(slice_stack).float()
+            slice_stack = F.interpolate(slice_stack.unsqueeze(0), size=(224, 224),
+                                         mode='bilinear', align_corners=False).squeeze(0)
 
-        # middle slice
-        z = data.shape[2] // 2
-        z_minus = max(z - 1, 0)
-        z_plus = min(z + 1, data.shape[2] - 1)
-
-        # 2.5D stack
-        slice_stack = np.stack([
-            data[:, :, z_minus],
-            data[:, :, z],
-            data[:, :, z_plus]
-        ], axis=0)
-
-        # normalize
-        slice_stack = (slice_stack - np.mean(slice_stack)) / (np.std(slice_stack) + 1e-8)
-
-        slice_stack = torch.tensor(slice_stack).float()
-
-        # resize to 224x224
-        slice_stack = F.interpolate(
-            slice_stack.unsqueeze(0),
-            size=(224, 224),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(0)
-
-        # label
-        label = file_to_label.get(filename, 0)
-        label = torch.tensor(label).float()
-
+        label = torch.tensor(self.file_to_labels[filename]).float()  # shape (num_labels,)
         return slice_stack, label
 
-# -------- MODEL --------
-model = models.resnet18(pretrained=True)
-model.fc = nn.Linear(model.fc.in_features, 1)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+def main():
+    file_to_labels, label_cols = load_labels()
+    num_labels = len(label_cols)
+    print(f"{num_labels} pathology labels: {label_cols}")
 
-# -------- TRAIN --------
-dataset = LungDataset2p5D("/scratch/25205761/hugenv/example_download_script/data_volumes/dataset/train")
-loader = DataLoader(dataset, batch_size=2, shuffle=True)
+    train_files, test_files = get_split(file_to_labels)
+    print(f"Train files: {len(train_files)} | Test files: {len(test_files)}")
 
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-criterion = nn.BCEWithLogitsLoss()
+    num_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 4))
+    train_loader = DataLoader(LungDataset2p5D(train_files, file_to_labels),
+                               batch_size=32, shuffle=True, num_workers=num_workers)
+    test_loader = DataLoader(LungDataset2p5D(test_files, file_to_labels),
+                              batch_size=32, shuffle=False, num_workers=num_workers)
 
-log_file = open("training_log.txt", "w")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = models.resnet18(weights="IMAGENET1K_V1")
+    model.fc = nn.Linear(model.fc.in_features, num_labels)
+    model = model.to(device)
 
-print("Starting training...")
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    criterion = nn.BCEWithLogitsLoss()
 
-for epoch in range(5):
-    for x, y in loader:
-        x, y = x.to(device), y.to(device)
+    log_file = open("training_log.txt", "w")
+    print("Starting training...")
+    num_epochs = 10
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            out = model(x)
+            loss = criterion(out, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * x.size(0)
+        train_loss = running_loss / len(train_loader.dataset)
 
-        out = model(x).squeeze()
-        loss = criterion(out, y)
+        # -------- quick validation each epoch --------
+        model.eval()
+        val_probs, val_labels = [], []
+        with torch.no_grad():
+            for x, y in test_loader:
+                x = x.to(device)
+                probs = torch.sigmoid(model(x)).cpu().numpy()
+                val_probs.append(probs)
+                val_labels.append(y.numpy())
+        val_probs = np.concatenate(val_probs, axis=0)
+        val_labels = np.concatenate(val_labels, axis=0)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        aucs = []
+        for i in range(num_labels):
+            if len(np.unique(val_labels[:, i])) > 1:
+                aucs.append(roc_auc_score(val_labels[:, i], val_probs[:, i]))
+        macro_auc = float(np.mean(aucs)) if aucs else float('nan')
 
-    print(f"Epoch {epoch}, Loss: {loss.item()}")
-    log_file.write(f"Epoch {epoch}, Loss: {loss.item()}\n")
-    log_file.flush()
+        line = f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Macro AUC: {macro_auc:.4f} (over {len(aucs)}/{num_labels} labels with both classes present)"
+        print(line)
+        log_file.write(line + "\n")
+        log_file.flush()
 
-torch.save(model.state_dict(), "model.pth")
+    torch.save(model.state_dict(), "model.pth")
+    log_file.close()
+    print("Training complete. Saved model.pth")
 
-print("Training complete.")
+
+if __name__ == "__main__":
+    main()

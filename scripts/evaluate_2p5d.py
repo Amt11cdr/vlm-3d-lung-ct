@@ -1,7 +1,5 @@
 import os
-import random
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,107 +8,108 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision import models
 from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
 
-# -------- REPRODUCIBILITY --------
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
+from data_common import load_labels, get_split, CACHE_DIR, SEED
+
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
 
-# -------- LABELS --------
-labels_df = pd.read_csv("../../hugenv/example_download_script/train_labels.csv")
-file_to_label = dict(zip(labels_df['VolumeName'], labels_df['Lung nodule']))
 
 # -------- DATASET --------
 class LungDataset2p5D(Dataset):
-    def __init__(self, files):
+    def __init__(self, files, file_to_labels):
         self.files = files
+        self.file_to_labels = file_to_labels
+
     def __len__(self):
         return len(self.files)
+
     def __getitem__(self, idx):
         file_path = self.files[idx]
         filename = os.path.basename(file_path).replace(".nii.gz", "")
-        data = nib.load(file_path).get_fdata()
-        z = data.shape[2] // 2
-        z_minus = max(z - 1, 0)
-        z_plus = min(z + 1, data.shape[2] - 1)
-        slice_stack = np.stack([data[:, :, z_minus], data[:, :, z], data[:, :, z_plus]], axis=0)
-        slice_stack = (slice_stack - np.mean(slice_stack)) / (np.std(slice_stack) + 1e-8)
-        slice_stack = torch.tensor(slice_stack).float()
-        slice_stack = F.interpolate(slice_stack.unsqueeze(0), size=(224, 224),
-                                    mode='bilinear', align_corners=False).squeeze(0)
-        label = torch.tensor(file_to_label.get(filename, 0)).float()
+        cache_path = os.path.join(CACHE_DIR, filename + ".npy")
+
+        if os.path.exists(cache_path):
+            slice_stack = torch.from_numpy(np.load(cache_path)).float()
+        else:
+            data = nib.load(file_path).get_fdata()
+            z = data.shape[2] // 2
+            z_minus = max(z - 1, 0)
+            z_plus = min(z + 1, data.shape[2] - 1)
+            slice_stack = np.stack([data[:, :, z_minus], data[:, :, z], data[:, :, z_plus]], axis=0)
+            slice_stack = (slice_stack - np.mean(slice_stack)) / (np.std(slice_stack) + 1e-8)
+            slice_stack = torch.tensor(slice_stack).float()
+            slice_stack = F.interpolate(slice_stack.unsqueeze(0), size=(224, 224),
+                                         mode='bilinear', align_corners=False).squeeze(0)
+
+        label = torch.tensor(self.file_to_labels[filename]).float()  # shape (num_labels,)
         return slice_stack, label
 
-# -------- GATHER + SPLIT (deterministic) --------
-root_dir = "/scratch/25205761/hugenv/example_download_script/data_volumes/dataset/train"
-all_files = []
-for root, _, files in os.walk(root_dir):
-    for f in files:
-        if f.endswith(".nii.gz"):
-            all_files.append(os.path.join(root, f))
-all_files = sorted(all_files)
-rng = random.Random(SEED)
-rng.shuffle(all_files)
-all_files = all_files[:2000]  # seeded subset for tractable runtime
-split = int(0.8 * len(all_files))
-train_files = all_files[:split]
-test_files = all_files[split:]
-print(f"Total: {len(all_files)} | Train: {len(train_files)} | Test: {len(test_files)}")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-train_loader = DataLoader(LungDataset2p5D(train_files), batch_size=16, shuffle=True, num_workers=1)
-test_loader = DataLoader(LungDataset2p5D(test_files), batch_size=16, shuffle=False, num_workers=1)
+def main():
+    file_to_labels, label_cols = load_labels()
+    num_labels = len(label_cols)
 
-# -------- MODEL --------
-model = models.resnet18(pretrained=True)
-model.fc = nn.Linear(model.fc.in_features, 1)
-model = model.to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-criterion = nn.BCEWithLogitsLoss()
+    train_files, test_files = get_split(file_to_labels)  # loads the SAME frozen split used in training
+    print(f"Evaluating on held-out test set: {len(test_files)} files "
+          f"(train set, unused here, has {len(train_files)} files)")
 
-# -------- TRAIN --------
-print("Training...")
-for epoch in range(5):
-    model.train()
-    for x, y in train_loader:
-        x, y = x.to(device), y.to(device)
-        out = model(x).squeeze(-1)
-        loss = criterion(out, y)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-    print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
+    num_workers = int(os.environ.get("SLURM_CPUS_PER_TASK", 4))
+    test_loader = DataLoader(LungDataset2p5D(test_files, file_to_labels),
+                              batch_size=32, shuffle=False, num_workers=num_workers)
 
-# -------- EVALUATE --------
-print("Evaluating on held-out test set...")
-model.eval()
-all_probs, all_labels = [], []
-with torch.no_grad():
-    for x, y in test_loader:
-        x = x.to(device)
-        probs = torch.sigmoid(model(x).squeeze(-1)).cpu().numpy()
-        all_probs.extend(np.atleast_1d(probs).tolist())
-        all_labels.extend(np.atleast_1d(y.numpy()).tolist())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = models.resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_labels)
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model.pth")
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model = model.to(device)
+    print(f"Loaded trained weights from {model_path}")
 
-all_labels = np.array(all_labels)
-all_preds = (np.array(all_probs) >= 0.5).astype(int)
-acc = accuracy_score(all_labels, all_preds)
-try:
-    auc = roc_auc_score(all_labels, all_probs)
-except ValueError:
-    auc = float('nan')
-tn, fp, fn, tp = confusion_matrix(all_labels, all_preds, labels=[0,1]).ravel()
-sens = tp / (tp + fn) if (tp + fn) else float('nan')
-spec = tn / (tn + fp) if (tn + fp) else float('nan')
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for x, y in test_loader:
+            x = x.to(device)
+            probs = torch.sigmoid(model(x)).cpu().numpy()
+            all_probs.append(probs)
+            all_labels.append(y.numpy())
+    all_probs = np.concatenate(all_probs, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    all_preds = (all_probs >= 0.5).astype(int)
 
-report = (f"Test set: {len(all_labels)} cases\n"
-          f"Accuracy: {acc:.4f}\nAUC: {auc:.4f}\n"
-          f"Sensitivity: {sens:.4f}\nSpecificity: {spec:.4f}\n"
-          f"Confusion: TN={tn} FP={fp} FN={fn} TP={tp}\nSeed: {SEED}\n")
-print(report)
-with open("evaluation_log.txt", "w") as f:
-    f.write(report)
-print("Saved to evaluation_log.txt")
+    lines = [f"Test set: {len(all_labels)} cases (patient-level split, seed={SEED})", ""]
+    per_label_aucs = []
+    header = f"{'Pathology':35s} {'N+':>6s} {'Acc':>7s} {'AUC':>7s} {'Sens':>7s} {'Spec':>7s}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for i, name in enumerate(label_cols):
+        y_true = all_labels[:, i]
+        y_pred = all_preds[:, i]
+        y_prob = all_probs[:, i]
+        n_pos = int(y_true.sum())
+        acc = accuracy_score(y_true, y_pred)
+        try:
+            auc = roc_auc_score(y_true, y_prob)
+            per_label_aucs.append(auc)
+        except ValueError:
+            auc = float('nan')  # only one class present in test set for this label
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        sens = tp / (tp + fn) if (tp + fn) else float('nan')
+        spec = tn / (tn + fp) if (tn + fp) else float('nan')
+        lines.append(f"{name:35s} {n_pos:6d} {acc:7.3f} {auc:7.3f} {sens:7.3f} {spec:7.3f}")
+
+    macro_auc = float(np.mean(per_label_aucs)) if per_label_aucs else float('nan')
+    lines.append("")
+    lines.append(f"Macro-average AUC (over {len(per_label_aucs)}/{num_labels} labels "
+                 f"with both classes present in test set): {macro_auc:.4f}")
+
+    report = "\n".join(lines)
+    print(report)
+    with open("evaluation_log.txt", "w") as f:
+        f.write(report + "\n")
+    print("\nSaved to evaluation_log.txt")
+
+
+if __name__ == "__main__":
+    main()
