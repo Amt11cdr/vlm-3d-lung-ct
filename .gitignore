@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.nii
+*.nii.gz
+data/
+eval_*.out
+.DS_Store
