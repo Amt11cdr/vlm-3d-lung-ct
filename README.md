@@ -1,4 +1,4 @@
-# VLM#D — Multi-Pathology Lung CT Classification
+# VLM3D — Multi-Pathology Lung CT Classification
 
 ## Motivation
 
