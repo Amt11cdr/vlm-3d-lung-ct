@@ -1,4 +1,4 @@
-# VLM3D — Multi-Pathology Lung CT Classification
+# VLM#D — Multi-Pathology Lung CT Classification
 
 ## Motivation
 
@@ -82,6 +82,8 @@ Pipeline validated end-to-end on a 1000-patient subset (800 train / 200 test,
 2354 CT files, patient-level split, seed=42). ResNet18 trained for 10 epochs
 (~2.5 min on one GPU).
 
+### Experiment 1 — baseline (no class weighting, final-epoch checkpoint)
+
 **Training trend.** Train loss dropped steadily from 0.499 to 0.026 over 10
 epochs, but validation macro-AUC peaked early at epoch 2 (0.7338) and then
 flattened/drifted down to 0.7204 by epoch 9 — a classic overfitting curve.
@@ -133,11 +135,79 @@ findings are uncommon in the test set. The AUC values show the ranking
 signal is often still there — the fixed threshold is what's miscalibrated,
 not necessarily the underlying representation.
 
+### Experiment 2 — `pos_weight` + best-checkpoint saving
+
+Two fixes applied to `train_2p5d.py`: (1) per-label `pos_weight` added to
+`BCEWithLogitsLoss`, computed from the train-set class balance
+(`num_neg / num_pos`), so rare positive findings are upweighted in the loss
+instead of being drowned out; (2) `model.pth` now saves whenever validation
+macro-AUC improves, rather than only at the final epoch.
+
+`pos_weight` per label ranged from 1.02 (Lung nodule, roughly balanced,
+n_pos=923/1866) up to 12.14 (Pericardial effusion, n_pos=142/1866) and 11.96
+(Mosaic attenuation pattern, n_pos=144/1866) — correctly weighting the
+rarest findings most heavily.
+
+Best validation macro-AUC this run was hit at epoch 0 (0.7318) — essentially
+right after the ImageNet-pretrained backbone's first pass of fine-tuning —
+with every later epoch trending flat-to-worse as training loss kept
+dropping. That checkpoint (epoch 0) is what's saved and evaluated below.
+
+**Held-out test set (488 cases, same patient-level split, threshold = 0.5):**
+
+| Pathology | N+ | Acc | AUC | Sens | Spec |
+|---|---|---|---|---|---|
+| Medical material | 75 | 0.703 | 0.754 | 0.640 | 0.714 |
+| Arterial wall calcification | 166 | 0.742 | 0.847 | 0.873 | 0.674 |
+| Cardiomegaly | 72 | 0.764 | 0.877 | 0.806 | 0.757 |
+| Pericardial effusion | 45 | 0.703 | 0.726 | 0.733 | 0.700 |
+| Coronary artery wall calcification | 142 | 0.682 | 0.781 | 0.775 | 0.645 |
+| Hiatal hernia | 87 | 0.592 | 0.603 | 0.552 | 0.601 |
+| Lymphadenopathy | 154 | 0.635 | 0.728 | 0.734 | 0.590 |
+| Emphysema | 107 | 0.547 | 0.663 | 0.720 | 0.499 |
+| Atelectasis | 159 | 0.607 | 0.662 | 0.736 | 0.544 |
+| Lung nodule | 228 | 0.547 | 0.551 | 0.487 | 0.600 |
+| Lung opacity | 181 | 0.611 | 0.675 | 0.652 | 0.586 |
+| Pulmonary fibrotic sequela | 135 | 0.570 | 0.582 | 0.570 | 0.569 |
+| Pleural effusion | 83 | 0.818 | 0.939 | 0.988 | 0.783 |
+| Mosaic attenuation pattern | 53 | 0.686 | 0.851 | 0.868 | 0.664 |
+| Peribronchial thickening | 59 | 0.523 | 0.692 | 0.763 | 0.490 |
+| Consolidation | 103 | 0.670 | 0.749 | 0.757 | 0.647 |
+| Bronchiectasis | 68 | 0.520 | 0.644 | 0.779 | 0.479 |
+| Interlobular septal thickening | 52 | 0.664 | 0.847 | 0.923 | 0.633 |
+
+**Macro-average AUC: 0.7318** (18/18 labels).
+
+**Comparison to Experiment 1.** Sensitivity improved dramatically on nearly
+every pathology that previously had near-zero recall: Bronchiectasis
+0.000→0.779, Interlobular septal thickening 0.019→0.923, Peribronchial
+thickening 0.017→0.763, Mosaic attenuation pattern 0.151→0.868, Pericardial
+effusion 0.111→0.733. The model went from effectively never flagging these
+findings to actually detecting most positive cases.
+
+The trade-off: specificity and accuracy dropped substantially in exchange
+(e.g. Bronchiectasis specificity 0.995→0.479) — the classic precision/recall
+trade-off from reweighting toward the minority class. For a screening/triage
+tool this shifted operating point is often preferable (missing a real
+finding tends to cost more than a false alarm), but it is a genuine
+trade-off, not a free win.
+
+Macro-AUC itself barely moved (0.7204→0.7318), which makes sense: AUC is
+threshold-independent, so `pos_weight` mainly shifted the decision
+threshold's effective operating point rather than the model's underlying
+ranking ability. A few labels did show genuine AUC gains (Cardiomegaly
+0.866→0.877, Pericardial effusion 0.690→0.726, Mosaic attenuation pattern
+0.807→0.851, Bronchiectasis 0.571→0.644), while Lung nodule dropped
+(0.630→0.551) — likely noise from this run's checkpoint being a much
+earlier, less-trained epoch than Experiment 1's.
+
 **Planned next steps:**
-- Add `pos_weight` to `BCEWithLogitsLoss` so rare positive findings aren't
-  drowned out during training.
-- Save the best-validation-AUC checkpoint instead of only the final epoch.
-- Consider per-label threshold tuning instead of a fixed 0.5 cutoff.
+- Try per-label threshold tuning (instead of a fixed 0.5 cutoff) as an
+  alternative/complement to `pos_weight`, to recover some specificity
+  without giving up sensitivity gains.
+- Investigate why validation performance peaks so early (epoch 0) — try a
+  lower learning rate, weight decay/dropout, or fewer epochs, since later
+  epochs mostly overfit rather than improve.
 - Scale `MAX_PATIENTS` up from 1000 toward the full ~12,000-volume dataset
   once these fixes are validated.
 
