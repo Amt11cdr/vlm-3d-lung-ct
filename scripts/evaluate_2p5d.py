@@ -6,9 +6,7 @@ import torch.nn.functional as F
 import nibabel as nib
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
-from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
-
-from data_common import load_labels, get_split, CACHE_DIR, SEED
+from data_common import load_labels, get_split, compute_multilabel_metrics, CACHE_DIR, SEED
 
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -75,34 +73,31 @@ def main():
             all_labels.append(y.numpy())
     all_probs = np.concatenate(all_probs, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
-    all_preds = (all_probs >= 0.5).astype(int)
+
+    # Metrics matching the VLM3D Challenge Task 1 (Multi-Abnormality Classification)
+    # official evaluation set: AUROC, F1, Precision, Recall, Accuracy. Specificity is
+    # kept too since it's clinically important for imbalanced findings even though it's
+    # not one of the official ranking metrics. (CRG is the official metric for the
+    # separate report-generation task, not classification, so it's not computed here.)
+    per_label, macro = compute_multilabel_metrics(all_labels, all_probs, label_cols)
 
     lines = [f"Test set: {len(all_labels)} cases (patient-level split, seed={SEED})", ""]
-    per_label_aucs = []
-    header = f"{'Pathology':35s} {'N+':>6s} {'Acc':>7s} {'AUC':>7s} {'Sens':>7s} {'Spec':>7s}"
+    header = f"{'Pathology':35s} {'N+':>6s} {'Acc':>7s} {'AUC':>7s} {'Prec':>7s} {'Recall':>7s} {'Spec':>7s} {'F1':>7s}"
     lines.append(header)
     lines.append("-" * len(header))
-
     for i, name in enumerate(label_cols):
-        y_true = all_labels[:, i]
-        y_pred = all_preds[:, i]
-        y_prob = all_probs[:, i]
-        n_pos = int(y_true.sum())
-        acc = accuracy_score(y_true, y_pred)
-        try:
-            auc = roc_auc_score(y_true, y_prob)
-            per_label_aucs.append(auc)
-        except ValueError:
-            auc = float('nan')  # only one class present in test set for this label
-        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-        sens = tp / (tp + fn) if (tp + fn) else float('nan')
-        spec = tn / (tn + fp) if (tn + fp) else float('nan')
-        lines.append(f"{name:35s} {n_pos:6d} {acc:7.3f} {auc:7.3f} {sens:7.3f} {spec:7.3f}")
+        lines.append(f"{name:35s} {per_label['n_pos'][i]:6d} {per_label['acc'][i]:7.3f} "
+                     f"{per_label['auc'][i]:7.3f} {per_label['precision'][i]:7.3f} "
+                     f"{per_label['recall'][i]:7.3f} {per_label['specificity'][i]:7.3f} "
+                     f"{per_label['f1'][i]:7.3f}")
 
-    macro_auc = float(np.mean(per_label_aucs)) if per_label_aucs else float('nan')
     lines.append("")
-    lines.append(f"Macro-average AUC (over {len(per_label_aucs)}/{num_labels} labels "
-                 f"with both classes present in test set): {macro_auc:.4f}")
+    lines.append(f"Macro-average AUC (over {macro['auc_n_labels']}/{num_labels} labels "
+                 f"with both classes present in test set): {macro['auc']:.4f}")
+    lines.append(f"Macro-average F1: {macro['f1']:.4f}")
+    lines.append(f"Macro-average Precision: {macro['precision']:.4f}")
+    lines.append(f"Macro-average Recall (Sensitivity): {macro['recall']:.4f}")
+    lines.append(f"Macro-average Accuracy: {macro['accuracy']:.4f}")
 
     report = "\n".join(lines)
     print(report)

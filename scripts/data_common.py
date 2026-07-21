@@ -12,7 +12,10 @@ across train/test (that would be leakage). We split at the patient level.
 """
 import os
 import random
+import numpy as np
 import pandas as pd
+from sklearn.metrics import (accuracy_score, roc_auc_score, confusion_matrix,
+                              precision_score, f1_score)
 
 SEED = 42
 
@@ -103,6 +106,50 @@ def load_split():
     with open(os.path.join(SPLIT_DIR, "test_files.txt")) as f:
         test_files = [l.strip() for l in f if l.strip()]
     return train_files, test_files
+
+
+def compute_multilabel_metrics(y_true, y_probs, label_cols, threshold=0.5):
+    """Computes VLM3D Challenge Task 1 metrics (AUROC, F1, Precision, Recall, Accuracy),
+    plus Specificity, per label and macro-averaged. Used identically by train_2p5d.py
+    (per-epoch validation) and evaluate_2p5d.py (final held-out evaluation) so the two
+    can never disagree on how a metric is computed.
+
+    y_true, y_probs: arrays of shape (N, num_labels).
+    Returns a dict with per-label lists and macro-averaged scalars.
+    """
+    y_pred = (y_probs >= threshold).astype(int)
+    num_labels = len(label_cols)
+
+    per_label = {"name": [], "n_pos": [], "acc": [], "auc": [],
+                 "precision": [], "recall": [], "specificity": [], "f1": []}
+
+    for i, name in enumerate(label_cols):
+        yt = y_true[:, i]
+        yp = y_pred[:, i]
+        yprob = y_probs[:, i]
+        per_label["name"].append(name)
+        per_label["n_pos"].append(int(yt.sum()))
+        per_label["acc"].append(accuracy_score(yt, yp))
+        per_label["precision"].append(precision_score(yt, yp, zero_division=0))
+        per_label["f1"].append(f1_score(yt, yp, zero_division=0))
+        try:
+            per_label["auc"].append(roc_auc_score(yt, yprob))
+        except ValueError:
+            per_label["auc"].append(float('nan'))  # only one class present
+        tn, fp, fn, tp = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
+        per_label["recall"].append(tp / (tp + fn) if (tp + fn) else float('nan'))
+        per_label["specificity"].append(tn / (tn + fp) if (tn + fp) else float('nan'))
+
+    valid_aucs = [a for a in per_label["auc"] if not np.isnan(a)]
+    macro = {
+        "auc": float(np.mean(valid_aucs)) if valid_aucs else float('nan'),
+        "auc_n_labels": len(valid_aucs),
+        "f1": float(np.mean(per_label["f1"])),
+        "precision": float(np.mean(per_label["precision"])),
+        "recall": float(np.mean(per_label["recall"])),
+        "accuracy": float(np.mean(per_label["acc"])),
+    }
+    return per_label, macro
 
 
 def get_split(file_to_labels):

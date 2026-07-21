@@ -211,6 +211,92 @@ earlier, less-trained epoch than Experiment 1's.
 - Scale `MAX_PATIENTS` up from 1000 toward the full ~12,000-volume dataset
   once these fixes are validated.
 
+### Experiment 3 — full metric suite (Precision, Recall, F1, AUC, Accuracy)
+
+The project is being built for the **VLM3D Challenge @ MICCAI 2025** (Task 1:
+Multi-Abnormality Classification on the CT-RATE dataset). The challenge's
+official Task 1 ranking metrics are AUROC, macro-F1, Precision, Recall, and
+Accuracy (CRG is a separate metric used for the report-generation task, not
+classification, so it isn't computed here). `evaluate_2p5d.py` and the
+per-epoch validation inside `train_2p5d.py` were updated to report this full
+set — via one shared `compute_multilabel_metrics()` function in
+`data_common.py` so the two scripts can't disagree on how a metric is
+computed.
+
+**Epoch-wise validation trend (10 epochs, same 800/200 patient split):**
+
+| Epoch | Train Loss | Val Acc | Val AUC | Val Prec | Val Recall | Val F1 |
+|---|---|---|---|---|---|---|
+| 0 | 0.9621 | 0.6444 | 0.7321 | 0.3514 | 0.7342 | 0.4580 |
+| 1 | 0.6546 | 0.7330 | 0.7246 | 0.3956 | 0.5808 | 0.4605 |
+| 2 | 0.4403 | 0.7559 | 0.7287 | 0.4141 | 0.4893 | 0.4411 |
+| 3 | 0.2900 | 0.7741 | 0.7194 | 0.4572 | 0.4323 | 0.4279 |
+| 4 | 0.1947 | 0.7703 | 0.7164 | 0.4321 | 0.4403 | 0.4274 |
+| 5 | 0.1386 | 0.7732 | 0.7143 | 0.4513 | 0.4164 | 0.4213 |
+| 6 | 0.1032 | 0.7831 | 0.7186 | 0.4638 | 0.3633 | 0.3937 |
+| 7 | 0.0818 | 0.7793 | 0.7153 | 0.4506 | 0.3726 | 0.3991 |
+| 8 | 0.0662 | 0.7838 | 0.7193 | 0.4615 | 0.3399 | 0.3819 |
+| 9 | 0.0538 | 0.7762 | 0.7170 | 0.4444 | 0.3948 | 0.4075 |
+
+This is the clearest view yet of the overfitting dynamic: accuracy climbs
+steadily (0.644→0.784) as training progresses, but recall falls in the
+opposite direction (0.734→~0.33-0.39), and F1 actually peaks at epoch 1
+(0.4605) before drifting down. AUC stays essentially flat (~0.71-0.73)
+throughout. In other words, additional epochs mostly make the model more
+conservative about predicting "positive" (trading recall for accuracy)
+without the underlying ranking ability improving — reinforcing that
+best-checkpoint selection (added in Experiment 2) is doing real work here,
+and that early stopping around epoch 0-1 is currently optimal for this
+learning rate / pos_weight combination.
+
+**Held-out test set (488 cases, epoch-0 checkpoint, threshold = 0.5):**
+
+| Pathology | N+ | Acc | AUC | Prec | Recall | Spec | F1 |
+|---|---|---|---|---|---|---|---|
+| Medical material | 75 | 0.689 | 0.745 | 0.269 | 0.600 | 0.705 | 0.372 |
+| Arterial wall calcification | 166 | 0.746 | 0.848 | 0.584 | 0.880 | 0.677 | 0.702 |
+| Cardiomegaly | 72 | 0.760 | 0.879 | 0.358 | 0.792 | 0.755 | 0.494 |
+| Pericardial effusion | 45 | 0.703 | 0.730 | 0.195 | 0.711 | 0.702 | 0.306 |
+| Coronary artery wall calcification | 142 | 0.691 | 0.781 | 0.480 | 0.768 | 0.659 | 0.591 |
+| Hiatal hernia | 87 | 0.615 | 0.600 | 0.244 | 0.552 | 0.628 | 0.338 |
+| Lymphadenopathy | 154 | 0.645 | 0.732 | 0.460 | 0.701 | 0.620 | 0.555 |
+| Emphysema | 107 | 0.543 | 0.662 | 0.279 | 0.682 | 0.504 | 0.396 |
+| Atelectasis | 159 | 0.598 | 0.658 | 0.431 | 0.723 | 0.538 | 0.540 |
+| Lung nodule | 228 | 0.549 | 0.553 | 0.519 | 0.478 | 0.612 | 0.498 |
+| Lung opacity | 181 | 0.621 | 0.680 | 0.492 | 0.641 | 0.609 | 0.556 |
+| Pulmonary fibrotic sequela | 135 | 0.578 | 0.580 | 0.341 | 0.563 | 0.584 | 0.425 |
+| Pleural effusion | 83 | 0.818 | 0.940 | 0.483 | 1.000 | 0.780 | 0.651 |
+| Mosaic attenuation pattern | 53 | 0.674 | 0.856 | 0.232 | 0.868 | 0.651 | 0.367 |
+| Peribronchial thickening | 59 | 0.520 | 0.692 | 0.170 | 0.763 | 0.487 | 0.278 |
+| Consolidation | 103 | 0.666 | 0.751 | 0.364 | 0.777 | 0.636 | 0.495 |
+| Bronchiectasis | 68 | 0.527 | 0.642 | 0.199 | 0.794 | 0.483 | 0.319 |
+| Interlobular septal thickening | 52 | 0.656 | 0.849 | 0.226 | 0.923 | 0.624 | 0.364 |
+
+**Macro-average: AUC 0.7321, F1 0.4580, Precision 0.3514, Recall 0.7342,
+Accuracy 0.6444.**
+
+Precision is low across almost every pathology (many below 0.3, e.g.
+Peribronchial thickening 0.170, Interlobular septal thickening 0.226,
+Mosaic attenuation pattern 0.232) while recall is high (several above 0.75,
+Pleural effusion hits 1.000). This is `pos_weight` doing exactly what it's
+designed to do — pushing hard toward flagging positives — but the current
+weighting is likely too aggressive for several labels, trading away more
+precision than necessary. F1 (which balances both) sits around 0.28-0.55
+depending on the pathology, giving a more honest single-number view per
+finding than accuracy alone would.
+
+**Planned next steps (updated):**
+- Tune down `pos_weight` (e.g. cap it, or use `sqrt(num_neg/num_pos)`
+  instead of the raw ratio) to recover precision without losing all the
+  recall gains — the current weighting looks over-corrected.
+- Try per-label threshold tuning as an alternative/complement to
+  `pos_weight`.
+- Try a lower learning rate or a short warmup/decay schedule, since useful
+  training clearly happens within the first 1-2 epochs and further epochs
+  currently just trade recall for accuracy without real gains.
+- Scale `MAX_PATIENTS` up from 1000 toward the full ~12,000-volume dataset
+  once the above are validated.
+
 ## Model weights
 
 Not tracked in git (`model.pth`, ~43MB). Kept on Sonic at

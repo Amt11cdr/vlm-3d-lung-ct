@@ -6,9 +6,7 @@ import torch.nn.functional as F
 import nibabel as nib
 from torch.utils.data import Dataset, DataLoader
 from torchvision import models
-from sklearn.metrics import roc_auc_score
-
-from data_common import load_labels, get_split, CACHE_DIR, SEED
+from data_common import load_labels, get_split, compute_multilabel_metrics, CACHE_DIR, SEED
 
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
@@ -64,12 +62,33 @@ def main():
     model.fc = nn.Linear(model.fc.in_features, num_labels)
     model = model.to(device)
 
+    # -------- CLASS-IMBALANCE HANDLING --------
+    # Several pathologies are rare in the training set (e.g. Bronchiectasis, Peribronchial
+    # thickening). Plain BCEWithLogitsLoss lets the model get away with (near) always
+    # predicting "negative" on those and still score well on accuracy. pos_weight upweights
+    # the loss on positive examples per-label, proportional to how rare they are, so the
+    # model is actually pushed to learn the minority class instead of ignoring it.
+    train_labels_arr = np.array([file_to_labels[os.path.basename(fp).replace(".nii.gz", "")]
+                                  for fp in train_files])
+    num_pos = train_labels_arr.sum(axis=0)
+    num_neg = len(train_labels_arr) - num_pos
+    pos_weight = torch.tensor(num_neg / np.clip(num_pos, 1, None), dtype=torch.float32).to(device)
+    print("Per-label pos_weight (train set):")
+    for name, w, p in zip(label_cols, pos_weight.tolist(), num_pos.tolist()):
+        print(f"  {name}: pos_weight={w:.2f} (n_pos={int(p)}/{len(train_labels_arr)})")
+
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     log_file = open("training_log.txt", "w")
+    header = (f"{'Epoch':>5s} {'TrainLoss':>10s} {'Val_Acc':>8s} {'Val_AUC':>8s} "
+              f"{'Val_Prec':>9s} {'Val_Recall':>10s} {'Val_F1':>8s}")
+    print(header)
+    log_file.write(header + "\n")
+
     print("Starting training...")
     num_epochs = 10
+    best_macro_auc = -1.0
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
@@ -83,7 +102,7 @@ def main():
             running_loss += loss.item() * x.size(0)
         train_loss = running_loss / len(train_loader.dataset)
 
-        # -------- quick validation each epoch --------
+        # -------- full validation each epoch (same metrics as evaluate_2p5d.py) --------
         model.eval()
         val_probs, val_labels = [], []
         with torch.no_grad():
@@ -95,20 +114,24 @@ def main():
         val_probs = np.concatenate(val_probs, axis=0)
         val_labels = np.concatenate(val_labels, axis=0)
 
-        aucs = []
-        for i in range(num_labels):
-            if len(np.unique(val_labels[:, i])) > 1:
-                aucs.append(roc_auc_score(val_labels[:, i], val_probs[:, i]))
-        macro_auc = float(np.mean(aucs)) if aucs else float('nan')
+        _, macro = compute_multilabel_metrics(val_labels, val_probs, label_cols)
+        macro_auc = macro["auc"]
 
-        line = f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Val Macro AUC: {macro_auc:.4f} (over {len(aucs)}/{num_labels} labels with both classes present)"
+        # -------- checkpoint on best validation macro-AUC, not just the final epoch --------
+        improved = macro_auc > best_macro_auc
+        if improved:
+            best_macro_auc = macro_auc
+            torch.save(model.state_dict(), "model.pth")
+
+        line = (f"{epoch:5d} {train_loss:10.4f} {macro['accuracy']:8.4f} {macro_auc:8.4f} "
+                f"{macro['precision']:9.4f} {macro['recall']:10.4f} {macro['f1']:8.4f}"
+                f"{'  <- new best AUC, saved model.pth' if improved else ''}")
         print(line)
         log_file.write(line + "\n")
         log_file.flush()
 
-    torch.save(model.state_dict(), "model.pth")
     log_file.close()
-    print("Training complete. Saved model.pth")
+    print(f"Training complete. Best Val Macro AUC: {best_macro_auc:.4f} (checkpoint saved to model.pth)")
 
 
 if __name__ == "__main__":
