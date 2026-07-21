@@ -78,9 +78,68 @@ Each stage has a matching SLURM submission script (`submit_preprocess.sh`,
 
 ## Status / Results
 
-Pipeline validated end-to-end on a 1000-patient subset; full results pending
-completion of the current preprocessing + training run. This section will be
-updated with per-pathology performance once available.
+Pipeline validated end-to-end on a 1000-patient subset (800 train / 200 test,
+2354 CT files, patient-level split, seed=42). ResNet18 trained for 10 epochs
+(~2.5 min on one GPU).
+
+**Training trend.** Train loss dropped steadily from 0.499 to 0.026 over 10
+epochs, but validation macro-AUC peaked early at epoch 2 (0.7338) and then
+flattened/drifted down to 0.7204 by epoch 9 — a classic overfitting curve.
+The current script saves only the final epoch's weights, so the evaluated
+model (below) is the more-overfit epoch 9, not the epoch-2 peak. Adding
+best-checkpoint saving is a planned next step.
+
+**Held-out test set (488 cases, 200 patients, threshold = 0.5):**
+
+| Pathology | N+ | Acc | AUC | Sens | Spec |
+|---|---|---|---|---|---|
+| Medical material | 75 | 0.834 | 0.753 | 0.200 | 0.949 |
+| Arterial wall calcification | 166 | 0.791 | 0.860 | 0.693 | 0.842 |
+| Cardiomegaly | 72 | 0.863 | 0.866 | 0.417 | 0.940 |
+| Pericardial effusion | 45 | 0.914 | 0.690 | 0.111 | 0.995 |
+| Coronary artery wall calcification | 142 | 0.719 | 0.793 | 0.514 | 0.803 |
+| Hiatal hernia | 87 | 0.793 | 0.570 | 0.092 | 0.945 |
+| Lymphadenopathy | 154 | 0.721 | 0.697 | 0.325 | 0.904 |
+| Emphysema | 107 | 0.791 | 0.671 | 0.262 | 0.940 |
+| Atelectasis | 159 | 0.672 | 0.672 | 0.371 | 0.818 |
+| Lung nodule | 228 | 0.611 | 0.630 | 0.649 | 0.577 |
+| Lung opacity | 181 | 0.689 | 0.685 | 0.436 | 0.837 |
+| Pulmonary fibrotic sequela | 135 | 0.689 | 0.564 | 0.207 | 0.873 |
+| Pleural effusion | 83 | 0.898 | 0.949 | 0.578 | 0.963 |
+| Mosaic attenuation pattern | 53 | 0.889 | 0.807 | 0.151 | 0.979 |
+| Peribronchial thickening | 59 | 0.848 | 0.602 | 0.017 | 0.963 |
+| Consolidation | 103 | 0.766 | 0.756 | 0.194 | 0.919 |
+| Bronchiectasis | 68 | 0.857 | 0.571 | 0.000 | 0.995 |
+| Interlobular septal thickening | 52 | 0.887 | 0.831 | 0.019 | 0.991 |
+
+**Macro-average AUC: 0.7204** (18/18 labels had both classes present in the
+test set).
+
+**Interpretation.** The model shows genuinely useful ranking ability on
+several findings — Pleural effusion (AUC 0.949), Cardiomegaly (0.866),
+Arterial wall calcification (0.860), Interlobular septal thickening (0.831),
+Mosaic attenuation pattern (0.807), and Coronary artery wall calcification
+(0.793) — while Hiatal hernia (0.570), Bronchiectasis (0.571), Pulmonary
+fibrotic sequela (0.564), and Peribronchial thickening (0.602) are close to
+chance.
+
+More importantly, several labels have near-zero sensitivity despite
+reasonable accuracy and AUC (Bronchiectasis 0.000, Interlobular septal
+thickening 0.019, Peribronchial thickening 0.017, Pericardial effusion
+0.111, Mosaic attenuation pattern 0.151). This is a class-imbalance effect:
+at the default 0.5 threshold, the model rarely predicts "positive" for
+rarer findings, and gets away with high accuracy simply because those
+findings are uncommon in the test set. The AUC values show the ranking
+signal is often still there — the fixed threshold is what's miscalibrated,
+not necessarily the underlying representation.
+
+**Planned next steps:**
+- Add `pos_weight` to `BCEWithLogitsLoss` so rare positive findings aren't
+  drowned out during training.
+- Save the best-validation-AUC checkpoint instead of only the final epoch.
+- Consider per-label threshold tuning instead of a fixed 0.5 cutoff.
+- Scale `MAX_PATIENTS` up from 1000 toward the full ~12,000-volume dataset
+  once these fixes are validated.
 
 ## Model weights
 
