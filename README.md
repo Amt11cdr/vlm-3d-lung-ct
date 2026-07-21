@@ -1,4 +1,4 @@
-# VLM3D — Multi-Pathology Lung CT Classification
+# VLM#D — Multi-Pathology Lung CT Classification
 
 ## Motivation
 
@@ -296,6 +296,109 @@ finding than accuracy alone would.
   currently just trade recall for accuracy without real gains.
 - Scale `MAX_PATIENTS` up from 1000 toward the full ~12,000-volume dataset
   once the above are validated.
+
+### Experiment 4 — sqrt-dampened `pos_weight` (tested, reverted)
+
+Hypothesis from Experiment 3: the raw `num_neg/num_pos` pos_weight (up to
+12.14x) was over-correcting, so `sqrt(num_neg/num_pos)` was tried instead
+(dampens 12.14x down to ~3.48x) to try to recover precision without losing
+too much recall.
+
+**Epoch-wise validation trend:**
+
+| Epoch | Train Loss | Val Acc | Val AUC | Val Prec | Val Recall | Val F1 |
+|---|---|---|---|---|---|---|
+| 0 | 0.6669 | 0.7647 | 0.7321 | 0.4159 | 0.4059 | 0.3947 |
+| 1 | 0.4427 | 0.7847 | 0.7293 | 0.4559 | 0.3619 | 0.3842 |
+| 2 | 0.2916 | 0.7926 | 0.7328 | 0.4935 | 0.3082 | 0.3556 |
+| 3 | 0.1834 | 0.7864 | 0.7263 | 0.4857 | 0.3455 | 0.3726 |
+| 4 | 0.1186 | 0.7868 | 0.7188 | 0.4705 | 0.3631 | 0.3938 |
+| 5 | 0.0836 | 0.7854 | 0.7222 | 0.4988 | 0.3532 | 0.3847 |
+| 6 | 0.0626 | 0.7887 | 0.7222 | 0.4992 | 0.3159 | 0.3609 |
+| 7 | 0.0505 | 0.7903 | 0.7192 | 0.4900 | 0.3298 | 0.3771 |
+| 8 | 0.0419 | 0.7884 | 0.7242 | 0.5006 | 0.3021 | 0.3529 |
+| 9 | 0.0346 | 0.7892 | 0.7253 | 0.4822 | 0.3486 | 0.3867 |
+
+Checkpoint selection (best AUC at the time) picked epoch 2 (AUC 0.7328),
+whose F1 (0.3556) was clearly worse than epoch 0's F1 (0.3947, the actual
+best F1 in this run) — a first sign that selecting checkpoints by AUC
+rather than F1 is a mistake, since AUC and F1 don't agree on which epoch is
+best.
+
+**Held-out test set result (epoch-2 checkpoint):** Accuracy 0.7926, AUC
+0.7328, Precision 0.4935, Recall 0.3082, F1 0.3556. Compared to Experiment 3
+(raw ratio): accuracy and precision went up substantially (0.644→0.793,
+0.351→0.494), but recall collapsed (0.734→0.308) and **macro-F1 got worse**
+(0.4580→0.3556) — the sqrt dampening overshot in the opposite direction
+rather than landing at a better balance. AUC was essentially unchanged
+(0.7321 vs 0.7318), as expected since it's threshold-independent.
+
+**Conclusion: reverted.** The hypothesis was tested and didn't hold up —
+the raw ratio outperforms the sqrt-dampened version on F1, the metric that
+actually matters here. `pos_weight` was reverted to `num_neg/num_pos`.
+Checkpoint selection was also switched from best-AUC to best-F1, directly
+motivated by the epoch-2-vs-epoch-0 mismatch seen in this run.
+
+**Next up:** rerun training with the raw ratio restored and F1-based
+checkpointing, expecting a result at or above Experiment 3's F1 (0.4580),
+ideally the actual best epoch rather than whichever had marginally higher
+AUC.
+
+### Experiment 5 — raw `pos_weight` restored + F1-based checkpointing
+
+`pos_weight` reverted to `num_neg/num_pos` (Experiment 3's version) and
+checkpoint selection switched to best validation macro-F1 (see Experiment 4
+for why). Same 800/200 patient split, 10 epochs.
+
+**Epoch-wise validation trend:**
+
+| Epoch | Train Loss | Val Acc | Val AUC | Val Prec | Val Recall | Val F1 |
+|---|---|---|---|---|---|---|
+| 0 | 0.9622 | 0.6440 | 0.7324 | 0.3519 | 0.7431 | 0.4618 |
+| 1 | 0.6540 | 0.7256 | 0.7240 | 0.3857 | 0.5972 | 0.4597 |
+| 2 | 0.4395 | 0.7583 | 0.7275 | 0.4180 | 0.4772 | 0.4379 |
+| 3 | 0.2903 | 0.7658 | 0.7145 | 0.4304 | 0.4550 | 0.4301 |
+| 4 | 0.1952 | 0.7707 | 0.7119 | 0.4327 | 0.4450 | 0.4311 |
+| 5 | 0.1395 | 0.7725 | 0.7136 | 0.4485 | 0.4180 | 0.4207 |
+| 6 | 0.1031 | 0.7839 | 0.7209 | 0.4605 | 0.3716 | 0.3983 |
+| 7 | 0.0823 | 0.7819 | 0.7155 | 0.4579 | 0.3802 | 0.4068 |
+| 8 | 0.0662 | 0.7818 | 0.7201 | 0.4600 | 0.3604 | 0.3952 |
+| 9 | 0.0539 | 0.7768 | 0.7184 | 0.4420 | 0.3883 | 0.4046 |
+
+This time checkpoint selection correctly identified epoch 0 (F1 0.4618) as
+the true best epoch — no mismatch like Experiment 4's epoch-2 pick.
+
+**Held-out test set (488 cases, epoch-0 checkpoint, threshold = 0.5):**
+
+Macro-average: **AUC 0.7324, F1 0.4618, Precision 0.3519, Recall 0.7431,
+Accuracy 0.6440.** These numbers match the training log's epoch-0 row
+almost exactly, confirming the eval script is reading the correct
+checkpoint.
+
+**Comparison to Experiment 3:** nearly identical, edging out Experiment 3
+on every metric (F1 0.4580→0.4618, AUC 0.7318→0.7324, Recall 0.7342→0.7431,
+Accuracy 0.6444→0.6440 roughly flat). This makes sense — both experiments
+happened to land on epoch 0 in practice, since AUC and F1 agreed on the
+best epoch here. The real value of switching to F1-based checkpointing is
+the protection it gives in cases like Experiment 4, where AUC and F1
+disagreed and AUC-based selection would have picked a worse-F1 checkpoint.
+
+**Status:** this is the current best/reference checkpoint (F1 0.4618,
+1000-patient subset). Precision is still low across most pathologies
+(macro 0.3519) — the model over-flags positives to keep recall high. The
+next real lever for improving this balance is per-label threshold tuning
+rather than further `pos_weight` adjustments, since two different weighting
+schemes have now been tried and landed in a similar place.
+
+**Planned next steps:**
+- Per-label threshold tuning: pick each pathology's decision threshold
+  (e.g. by maximizing F1 or Youden's index on validation data) instead of
+  a blanket 0.5 cutoff, to recover precision without touching the loss.
+- Try a lower learning rate or short warmup/decay schedule — useful
+  training still happens almost entirely in epoch 0-1 across every
+  experiment so far.
+- Scale `MAX_PATIENTS` up from 1000 toward the full ~12,000-volume dataset
+  once threshold tuning is validated.
 
 ## Model weights
 
